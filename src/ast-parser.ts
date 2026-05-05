@@ -10,56 +10,31 @@ export interface FunctionDef {
   returnType: string;
 }
 
-export function parseFunctions(filename: string, content: string): FunctionDef[] {
-  const sourceFile = ts.createSourceFile(filename, content, ts.ScriptTarget.Latest, true);
-  const functions: FunctionDef[] = [];
+type FunctionNode =
+  | ts.FunctionDeclaration
+  | ts.MethodDeclaration
+  | ts.FunctionExpression
+  | ts.ArrowFunction;
 
-  function visit(node: ts.Node): void {
-    if (
-      ts.isFunctionDeclaration(node) ||
-      ts.isMethodDeclaration(node) ||
-      ts.isFunctionExpression(node) ||
-      ts.isArrowFunction(node)
-    ) {
-      const name = resolveName(node, sourceFile);
-      const start = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
-      const end = sourceFile.getLineAndCharacterOfPosition(node.getEnd());
-
-      functions.push({
-        name,
-        file: filename,
-        startLine: start.line + 1,
-        endLine: end.line + 1,
-        body: node.getText(sourceFile),
-        parameters: node.parameters.map((p) => p.getText(sourceFile)).join(', '),
-        returnType: node.type ? node.type.getText(sourceFile) : '',
-      });
-    }
-
-    ts.forEachChild(node, visit);
-  }
-
-  visit(sourceFile);
-  return functions;
+function isFunctionNode(node: ts.Node): node is FunctionNode {
+  return (
+    ts.isFunctionDeclaration(node) ||
+    ts.isMethodDeclaration(node) ||
+    ts.isFunctionExpression(node) ||
+    ts.isArrowFunction(node)
+  );
 }
 
-function resolveName(
-  node: ts.FunctionDeclaration | ts.MethodDeclaration | ts.FunctionExpression | ts.ArrowFunction,
-  sourceFile: ts.SourceFile
-): string {
-  if (
-    (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) &&
-    node.name
-  ) {
+function resolveName(node: FunctionNode): string {
+  if ((ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) && node.name) {
     return node.name.text;
   }
 
   if (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name)) {
-    const className = findParentClassName(node, sourceFile);
+    const className = findParentClassName(node);
     return className ? `${className}.${node.name.text}` : node.name.text;
   }
 
-  // arrow function or anonymous — check if assigned to a variable
   const parent = node.parent;
   if (ts.isVariableDeclaration(parent) && ts.isIdentifier(parent.name)) {
     return parent.name.text;
@@ -71,7 +46,7 @@ function resolveName(
   return '(anonymous)';
 }
 
-function findParentClassName(node: ts.Node, sourceFile: ts.SourceFile): string | null {
+function findParentClassName(node: ts.Node): string | null {
   let current: ts.Node = node.parent;
   while (current) {
     if (ts.isClassDeclaration(current) && current.name) {
@@ -80,6 +55,35 @@ function findParentClassName(node: ts.Node, sourceFile: ts.SourceFile): string |
     current = current.parent;
   }
   return null;
+}
+
+function visitFunctionNode(
+  node: ts.Node,
+  sourceFile: ts.SourceFile,
+  filename: string,
+  functions: FunctionDef[]
+): void {
+  if (isFunctionNode(node)) {
+    const start = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+    const end = sourceFile.getLineAndCharacterOfPosition(node.getEnd());
+    functions.push({
+      name: resolveName(node),
+      file: filename,
+      startLine: start.line + 1,
+      endLine: end.line + 1,
+      body: node.getText(sourceFile),
+      parameters: node.parameters.map((p) => p.getText(sourceFile)).join(', '),
+      returnType: node.type ? node.type.getText(sourceFile) : '',
+    });
+  }
+  ts.forEachChild(node, (child) => visitFunctionNode(child, sourceFile, filename, functions));
+}
+
+export function parseFunctions(filename: string, content: string): FunctionDef[] {
+  const sourceFile = ts.createSourceFile(filename, content, ts.ScriptTarget.Latest, true);
+  const functions: FunctionDef[] = [];
+  visitFunctionNode(sourceFile, sourceFile, filename, functions);
+  return functions;
 }
 
 export function getFunctionsInRange(
@@ -105,12 +109,12 @@ export function parseGlobals(filename: string, content: string): GlobalDef[] {
   const sourceFile = ts.createSourceFile(filename, content, ts.ScriptTarget.Latest, true);
   const globals: GlobalDef[] = [];
 
-  // Only look at top-level statements — not inside functions or classes
   for (const statement of sourceFile.statements) {
     if (!ts.isVariableStatement(statement)) continue;
     for (const decl of statement.declarationList.declarations) {
       if (!ts.isIdentifier(decl.name)) continue;
-      const line = sourceFile.getLineAndCharacterOfPosition(statement.getStart(sourceFile)).line + 1;
+      const line =
+        sourceFile.getLineAndCharacterOfPosition(statement.getStart(sourceFile)).line + 1;
       globals.push({
         name: decl.name.text,
         file: filename,

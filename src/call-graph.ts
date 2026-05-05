@@ -8,23 +8,22 @@ export interface CallGraph {
   callees: Map<string, Set<string>>;
 }
 
+function visitCallNode(node: ts.Node, calls: Set<string>): void {
+  if (ts.isCallExpression(node)) {
+    const expr = node.expression;
+    if (ts.isIdentifier(expr)) {
+      calls.add(expr.text);
+    } else if (ts.isPropertyAccessExpression(expr) && ts.isIdentifier(expr.name)) {
+      calls.add(expr.name.text);
+    }
+  }
+  ts.forEachChild(node, (child) => visitCallNode(child, calls));
+}
+
 function extractCallNames(body: string): string[] {
   const sourceFile = ts.createSourceFile('temp.ts', body, ts.ScriptTarget.Latest, true);
   const calls = new Set<string>();
-
-  function visit(node: ts.Node): void {
-    if (ts.isCallExpression(node)) {
-      const expr = node.expression;
-      if (ts.isIdentifier(expr)) {
-        calls.add(expr.text);
-      } else if (ts.isPropertyAccessExpression(expr) && ts.isIdentifier(expr.name)) {
-        calls.add(expr.name.text);
-      }
-    }
-    ts.forEachChild(node, visit);
-  }
-
-  visit(sourceFile);
+  visitCallNode(sourceFile, calls);
   return [...calls];
 }
 
@@ -46,11 +45,8 @@ export function buildCallGraph(allFunctions: FunctionDef[]): CallGraph {
 }
 
 export interface AffectedFunctions {
-  // Priority 1: functions directly changed in the diff
   changed: FunctionDef[];
-  // Priority 2: functions that directly call a changed function
   directCallers: FunctionDef[];
-  // Priority 3: functions that call a direct caller
   secondaryCallers: FunctionDef[];
 }
 
@@ -91,24 +87,24 @@ export function getAffectedFunctions(
   return { changed: changedFunctions, directCallers, secondaryCallers };
 }
 
-function functionReferencesGlobal(fn: FunctionDef, globalName: string): boolean {
-  const sourceFile = ts.createSourceFile('temp.ts', fn.body, ts.ScriptTarget.Latest, true);
-  let found = false;
-
-  function visit(node: ts.Node): void {
-    if (found) return;
-    if (ts.isIdentifier(node) && node.text === globalName) {
-      // Skip if this identifier is itself a variable declaration name
-      const parent = node.parent;
-      if (!(ts.isVariableDeclaration(parent) && parent.name === node)) {
-        found = true;
-      }
+function nodeReferencesGlobal(node: ts.Node, globalName: string): boolean {
+  if (ts.isIdentifier(node) && node.text === globalName) {
+    const parent = node.parent;
+    if (!(ts.isVariableDeclaration(parent) && parent.name === node)) {
+      return true;
     }
-    ts.forEachChild(node, visit);
   }
 
-  visit(sourceFile);
+  let found = false;
+  ts.forEachChild(node, (child) => {
+    if (!found) found = nodeReferencesGlobal(child, globalName);
+  });
   return found;
+}
+
+function functionReferencesGlobal(fn: FunctionDef, globalName: string): boolean {
+  const sourceFile = ts.createSourceFile('temp.ts', fn.body, ts.ScriptTarget.Latest, true);
+  return nodeReferencesGlobal(sourceFile, globalName);
 }
 
 export function getGlobalReferencingFunctions(

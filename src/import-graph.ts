@@ -1,8 +1,6 @@
 import path from 'path';
 
 export interface ImportGraph {
-  // file -> set of files it imports
-  forward: Map<string, Set<string>>;
   // file -> set of files that import it
   reverse: Map<string, Set<string>>;
 }
@@ -50,7 +48,6 @@ function resolveImport(
 
 export function buildImportGraph(fileContents: Map<string, string>): ImportGraph {
   const knownFiles = new Set(fileContents.keys());
-  const forward = new Map<string, Set<string>>();
   const reverse = new Map<string, Set<string>>();
 
   for (const [file, content] of fileContents) {
@@ -59,15 +56,12 @@ export function buildImportGraph(fileContents: Map<string, string>): ImportGraph
       const resolved = resolveImport(raw, file, knownFiles);
       if (resolved === null) continue;
 
-      if (!forward.has(file)) forward.set(file, new Set());
-      forward.get(file)!.add(resolved);
-
       if (!reverse.has(resolved)) reverse.set(resolved, new Set());
       reverse.get(resolved)!.add(file);
     }
   }
 
-  return { forward, reverse };
+  return { reverse };
 }
 
 export function getAffectedFiles(
