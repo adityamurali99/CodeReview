@@ -18,34 +18,22 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
-function formatFunction(fn: FunctionDef, label: string): ContextSection {
-  const content = [
-    `// ${fn.file} — lines ${fn.startLine}-${fn.endLine}`,
-    fn.body,
-  ].join('\n');
-
-  return { label, content, priority: 0 };
+function changedFileSection(file: ChangedFile, priority: number): ContextSection {
+  const lines = [`### ${file.filename} [${file.status}]`];
+  if (file.patch) lines.push('```diff', file.patch, '```');
+  return { label: `Changed file: ${file.filename}`, content: lines.join('\n'), priority };
 }
 
-function formatChangedFile(file: ChangedFile): ContextSection {
-  const lines: string[] = [`### ${file.filename} [${file.status}]`];
-
-  if (file.patch) {
-    lines.push('```diff', file.patch, '```');
-  }
-
-  return {
-    label: `Changed file: ${file.filename}`,
-    content: lines.join('\n'),
-    priority: 0,
-  };
+function functionSection(fn: FunctionDef, label: string, priority: number): ContextSection {
+  const content = `// ${fn.file} — lines ${fn.startLine}-${fn.endLine}\n${fn.body}`;
+  return { label, content, priority };
 }
 
-function formatGlobal(g: GlobalDef): ContextSection {
+function globalSection(g: GlobalDef, priority: number): ContextSection {
   return {
     label: `Changed global: ${g.name}`,
     content: `// ${g.file} — line ${g.line}\n${g.body}`,
-    priority: 0,
+    priority,
   };
 }
 
@@ -54,43 +42,25 @@ export function assembleContext(
   affected: AffectedFunctions,
   changedGlobals: GlobalDef[] = [],
   globalReferencers: FunctionDef[] = [],
-  TOKEN_BUDGET = 80_000
+  tokenBudget = 80_000
 ): AssembledContext {
-  const sections: ContextSection[] = [];
+  const sections: ContextSection[] = [
+    ...changedFiles.map((f) => changedFileSection(f, 1)),
+    ...changedGlobals.map((g) => globalSection(g, 2)),
+    ...affected.changed.map((fn) => functionSection(fn, `Changed function: ${fn.name}`, 2)),
+    ...affected.directCallers.map((fn) => functionSection(fn, `Direct caller: ${fn.name}`, 3)),
+    ...globalReferencers.map((fn) => functionSection(fn, `References global: ${fn.name}`, 3)),
+    ...affected.secondaryCallers.map((fn) => functionSection(fn, `Secondary caller: ${fn.name}`, 4)),
+  ];
 
-  // Priority 1 — diffs of changed files
-  for (const file of changedFiles) {
-    sections.push({ ...formatChangedFile(file), priority: 1 });
-  }
+  sections.sort((a, b) => a.priority - b.priority);
 
-  // Priority 2 — changed globals and changed functions (equal priority)
-  for (const g of changedGlobals) {
-    sections.push({ ...formatGlobal(g), priority: 2 });
-  }
-  for (const fn of affected.changed) {
-    sections.push({ ...formatFunction(fn, `Changed function: ${fn.name}`), priority: 2 });
-  }
-
-  // Priority 3 — direct callers + functions referencing changed globals
-  for (const fn of affected.directCallers) {
-    sections.push({ ...formatFunction(fn, `Direct caller: ${fn.name}`), priority: 3 });
-  }
-  for (const fn of globalReferencers) {
-    sections.push({ ...formatFunction(fn, `References global: ${fn.name}`), priority: 3 });
-  }
-
-  // Priority 4 — secondary callers
-  for (const fn of affected.secondaryCallers) {
-    sections.push({ ...formatFunction(fn, `Secondary caller: ${fn.name}`), priority: 4 });
-  }
-
-  // Apply token budget: include all sections until budget is exhausted
   const included: ContextSection[] = [];
   let totalTokens = 0;
 
-  for (const section of sections.sort((a, b) => a.priority - b.priority)) {
+  for (const section of sections) {
     const tokens = estimateTokens(section.content);
-    if (totalTokens + tokens > TOKEN_BUDGET) break;
+    if (totalTokens + tokens > tokenBudget) break;
     included.push(section);
     totalTokens += tokens;
   }

@@ -12,10 +12,9 @@ export interface StaticIssue {
   severity: 'error' | 'warning';
 }
 
-// Write changed files to a temp directory so we can run tools on them
-function writeTempFiles(changedFiles: ChangedFile[]): string {
+function writeTempFiles(files: ChangedFile[]): string {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'code-review-'));
-  for (const file of changedFiles) {
+  for (const file of files) {
     if (file.newContent === null) continue;
     const dest = path.join(tmpDir, file.filename);
     fs.mkdirSync(path.dirname(dest), { recursive: true });
@@ -24,69 +23,71 @@ function writeTempFiles(changedFiles: ChangedFile[]): string {
   return tmpDir;
 }
 
-function cleanupTempDir(dir: string): void {
-  fs.rmSync(dir, { recursive: true, force: true });
+// execSync throws on non-zero exit codes — this extracts stdout from the error object
+function getStdout(err: unknown): string | null {
+  if (typeof err === 'object' && err !== null && 'stdout' in err) {
+    const stdout = (err as { stdout: unknown }).stdout;
+    if (typeof stdout === 'string') return stdout;
+  }
+  return null;
 }
 
 function runEslint(tmpDir: string, filenames: string[]): StaticIssue[] {
-  const issues: StaticIssue[] = [];
   const targets = filenames
     .map((f) => path.join(tmpDir, f))
     .filter((f) => fs.existsSync(f));
 
-  if (targets.length === 0) return issues;
+  if (targets.length === 0) return [];
 
   try {
     execSync(`npx eslint --format json ${targets.map((f) => `"${f}"`).join(' ')}`, {
       encoding: 'utf-8',
     });
-  } catch (err: unknown) {
-    // eslint exits with code 1 when it finds issues — the output is still valid JSON
-    const output = getExecOutput(err);
-    if (!output) return issues;
+    return [];
+  } catch (err) {
+    // eslint exits with code 1 when it finds issues — stdout is still valid JSON
+    const stdout = getStdout(err);
+    if (!stdout) return [];
 
     try {
-      const results = JSON.parse(output) as Array<{
+      type EslintResult = {
         filePath: string;
         messages: Array<{ line: number; message: string; severity: number }>;
-      }>;
+      };
 
-      for (const result of results) {
+      return (JSON.parse(stdout) as EslintResult[]).flatMap((result) => {
         const filename = path.relative(tmpDir, result.filePath).replace(/\\/g, '/');
-        for (const msg of result.messages) {
-          issues.push({
-            filename,
-            line: msg.line,
-            message: msg.message,
-            tool: 'eslint',
-            severity: msg.severity === 2 ? 'error' : 'warning',
-          });
-        }
-      }
+        return result.messages.map((msg) => ({
+          filename,
+          line: msg.line,
+          message: msg.message,
+          tool: 'eslint' as const,
+          severity: msg.severity === 2 ? ('error' as const) : ('warning' as const),
+        }));
+      });
     } catch {
-      // eslint output wasn't JSON — ignore
+      return [];
     }
   }
-
-  return issues;
 }
 
 function runTsc(tmpDir: string): StaticIssue[] {
-  const issues: StaticIssue[] = [];
-
   try {
     execSync(`npx tsc --noEmit --allowJs --checkJs false --strict false --baseUrl "${tmpDir}"`, {
       cwd: tmpDir,
       encoding: 'utf-8',
     });
-  } catch (err: unknown) {
-    const output = getExecOutput(err);
-    if (!output) return issues;
+    return [];
+  } catch (err) {
+    const stdout = getStdout(err);
+    if (!stdout) return [];
 
     // tsc output format: "file(line,col): error TSxxxx: message"
-    const lineRegex = /^(.+?)\((\d+),\d+\):\s+(error|warning)\s+TS\d+:\s+(.+)$/gm;
+    const issues: StaticIssue[] = [];
+    const linePattern = /^(.+?)\((\d+),\d+\):\s+(error|warning)\s+TS\d+:\s+(.+)$/gm;
     let match;
-    while ((match = lineRegex.exec(output)) !== null) {
+
+    while ((match = linePattern.exec(stdout)) !== null) {
       const [, filePath, line, severity, message] = match;
       if (!filePath || !line || !severity || !message) continue;
       issues.push({
@@ -97,37 +98,23 @@ function runTsc(tmpDir: string): StaticIssue[] {
         severity: severity === 'error' ? 'error' : 'warning',
       });
     }
-  }
 
-  return issues;
-}
-
-function getExecOutput(err: unknown): string | null {
-  if (
-    typeof err === 'object' &&
-    err !== null &&
-    'stdout' in err &&
-    typeof (err as { stdout: unknown }).stdout === 'string'
-  ) {
-    return (err as { stdout: string }).stdout;
+    return issues;
   }
-  return null;
 }
 
 export async function runStaticAnalysis(changedFiles: ChangedFile[]): Promise<StaticIssue[]> {
-  const nonDeleted = changedFiles.filter((f) => f.status !== 'deleted' && f.newContent !== null);
-  if (nonDeleted.length === 0) return [];
+  const filesToAnalyze = changedFiles.filter(
+    (f) => f.status !== 'deleted' && f.newContent !== null
+  );
+  if (filesToAnalyze.length === 0) return [];
 
-  const tmpDir = writeTempFiles(nonDeleted);
+  const tmpDir = writeTempFiles(filesToAnalyze);
 
   try {
-    const filenames = nonDeleted.map((f) => f.filename);
-    const [eslintIssues, tscIssues] = await Promise.all([
-      Promise.resolve(runEslint(tmpDir, filenames)),
-      Promise.resolve(runTsc(tmpDir)),
-    ]);
-    return [...eslintIssues, ...tscIssues];
+    const filenames = filesToAnalyze.map((f) => f.filename);
+    return [...runEslint(tmpDir, filenames), ...runTsc(tmpDir)];
   } finally {
-    cleanupTempDir(tmpDir);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }

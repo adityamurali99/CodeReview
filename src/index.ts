@@ -2,6 +2,8 @@
 import 'dotenv/config';
 import { Command } from 'commander';
 import { z } from 'zod';
+import Anthropic from '@anthropic-ai/sdk';
+import { Octokit } from '@octokit/rest';
 import { GitHubClient } from './github';
 import { buildImportGraph, getAffectedFiles } from './import-graph';
 import { parseFunctions, getFunctionsInRange, parseGlobals, getGlobalsInRange } from './ast-parser';
@@ -9,7 +11,10 @@ import { buildCallGraph, getAffectedFunctions, getGlobalReferencingFunctions } f
 import { assembleContext } from './context-builder';
 import { runStaticAnalysis } from './static-analysis';
 import { getReview } from './reviewer';
+import { judgeReview } from './judge';
 import { postReview } from './commenter';
+import { parsePatchLines } from './diff';
+import { initLogger, log } from './logger';
 
 const EnvSchema = z.object({
   GITHUB_TOKEN: z.string().min(1),
@@ -28,109 +33,124 @@ program
     if (isNaN(n) || n <= 0) throw new Error('PR number must be a positive integer');
     return n;
   })
+  .option('--debug', 'Enable verbose debug logging', false)
   .action(async (options) => {
+    initLogger(options.debug as boolean);
+
     const env = EnvSchema.safeParse(process.env);
     if (!env.success) {
-      console.error('Missing required environment variables:');
-      env.error.issues.forEach((i) => console.error(` - ${i.path.join('.')}: ${i.message}`));
+      env.error.issues.forEach((i) =>
+        log().error({ field: i.path.join('.') }, `Missing env var: ${i.message}`)
+      );
       process.exit(1);
     }
 
     const { GITHUB_TOKEN, ANTHROPIC_API_KEY } = env.data;
     const { owner, repo, pr: prNumber } = options;
 
-    console.log(`\nReviewing PR #${prNumber} on ${owner}/${repo}...\n`);
+    const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+    const octokit = new Octokit({ auth: GITHUB_TOKEN });
+    const github = new GitHubClient(octokit, owner, repo);
 
-    // Phase 2: Fetch PR data from GitHub
-    console.log('[1/7] Fetching PR metadata and changed files...');
-    const github = new GitHubClient(GITHUB_TOKEN, owner, repo);
-    const pr = await github.getPRMetadata(prNumber);
-    const changedFiles = await github.getChangedFiles(pr);
-    console.log(`      PR: "${pr.title}"`);
-    console.log(`      ${changedFiles.length} changed file(s)`);
+    log().info({ owner, repo, prNumber }, `Reviewing PR #${prNumber} on ${owner}/${repo}`);
 
-    // Phase 3: Build import graph over the entire repo (TS/JS files only)
-    console.log('[2/7] Building import graph...');
-    const fileTree = await github.getFileTree(pr.headSha);
-    const tsFiles = fileTree.filter((f) => /\.(ts|tsx|js|jsx)$/.test(f));
-    const allContents = await github.batchGetFileContents(tsFiles, pr.headSha);
-    const importGraph = buildImportGraph(allContents);
-    const changedFilenames = changedFiles.map((f) => f.filename);
-    const affectedFilenames = getAffectedFiles(changedFilenames, importGraph);
-    console.log(`      ${affectedFilenames.size} file(s) affected via imports`);
+    try {
+      // [1/8] Fetch PR metadata and the list of changed files with their diffs
+      log().info('Fetching PR metadata and changed files...');
+      const pr = await github.getPRMetadata(prNumber);
+      const changedFiles = await github.getChangedFiles(pr);
+      log().info({ title: pr.title, fileCount: changedFiles.length }, '[1/8] PR fetched');
 
-    // Phase 4: Parse AST for changed + affected files only
-    console.log('[3/7] Parsing AST...');
-    const filesToParse = [...changedFilenames, ...affectedFilenames];
-    const allFunctions = filesToParse.flatMap((filename) => {
-      const content = allContents.get(filename);
-      return content ? parseFunctions(filename, content) : [];
-    });
-    const allGlobals = filesToParse.flatMap((filename) => {
-      const content = allContents.get(filename);
-      return content ? parseGlobals(filename, content) : [];
-    });
-    console.log(`      ${allFunctions.length} function(s) and ${allGlobals.length} global(s) indexed`);
+      // [2/8] Fetch all TS/JS files in the repo and build a reverse import map
+      log().info('Building import graph...');
+      const fileTree = await github.getFileTree(pr.headSha);
+      const tsFiles = fileTree.filter((f) => /\.(ts|tsx|js|jsx)$/.test(f));
+      const allFileContents = await github.batchGetFileContents(tsFiles, pr.headSha);
+      const importGraph = buildImportGraph(allFileContents);
+      const changedFilenames = changedFiles.map((f) => f.filename);
+      const affectedFilenames = getAffectedFiles(changedFilenames, importGraph);
+      log().info({ affectedCount: affectedFilenames.size }, '[2/8] Import graph built');
 
-    // Phase 5: Build call graph and find affected functions + globals
-    console.log('[4/7] Building call graph...');
-    const callGraph = buildCallGraph(allFunctions);
-    const changedFunctions = changedFiles.flatMap((file) => {
-      if (!file.patch) return [];
-      const changedLines = parsePatchLines(file.patch);
-      return getFunctionsInRange(allFunctions, file.filename, changedLines);
-    });
-    const changedGlobals = changedFiles.flatMap((file) => {
-      if (!file.patch) return [];
-      const changedLines = parsePatchLines(file.patch);
-      return getGlobalsInRange(allGlobals, file.filename, changedLines);
-    });
-    const affectedFunctions = getAffectedFunctions(changedFunctions, callGraph);
-    const globalReferencers = getGlobalReferencingFunctions(changedGlobals, allFunctions);
-    console.log(
-      `      ${changedFunctions.length} changed function(s), ` +
-        `${changedGlobals.length} changed global(s), ` +
-        `${affectedFunctions.directCallers.length} direct caller(s), ` +
-        `${globalReferencers.length} global referencer(s)`
-    );
+      // [3/8] Parse functions and globals from changed + affected files only
+      log().info('Parsing AST...');
+      const filesToParse = [...changedFilenames, ...affectedFilenames];
+      const allFunctions = filesToParse.flatMap((filename) => {
+        const content = allFileContents.get(filename);
+        return content ? parseFunctions(filename, content) : [];
+      });
+      const allGlobals = filesToParse.flatMap((filename) => {
+        const content = allFileContents.get(filename);
+        return content ? parseGlobals(filename, content) : [];
+      });
+      log().info({ functionCount: allFunctions.length, globalCount: allGlobals.length }, '[3/8] AST parsed');
 
-    // Phase 6: Assemble context within token budget
-    console.log('[5/7] Assembling context...');
-    const context = assembleContext(changedFiles, affectedFunctions, changedGlobals, globalReferencers);
-    console.log(`      ~${context.totalTokens.toLocaleString()} tokens assembled`);
+      // [4/8] Build call graph and identify which functions and globals were touched
+      log().info('Building call graph...');
+      const callGraph = buildCallGraph(allFunctions);
+      const changedFunctions = changedFiles.flatMap((file) => {
+        if (!file.patch) return [];
+        const changedLines = parsePatchLines(file.patch);
+        return getFunctionsInRange(allFunctions, file.filename, changedLines);
+      });
+      const changedGlobals = changedFiles.flatMap((file) => {
+        if (!file.patch) return [];
+        const changedLines = parsePatchLines(file.patch);
+        return getGlobalsInRange(allGlobals, file.filename, changedLines);
+      });
+      const affectedFunctions = getAffectedFunctions(changedFunctions, callGraph);
+      const globalReferencers = getGlobalReferencingFunctions(changedGlobals, allFunctions);
 
-    // Phase 7: Run static analysis on changed files
-    console.log('[6/7] Running static analysis...');
-    const staticIssues = await runStaticAnalysis(changedFiles);
-    console.log(`      ${staticIssues.length} static issue(s) found`);
+      // Warn about changed files whose diffs touch no known function — often new files or top-level code
+      const parsedFilenames = new Set(changedFunctions.map((fn) => fn.file));
+      const unmatchedFiles = changedFiles.filter(
+        (f) => f.patch && !parsedFilenames.has(f.filename)
+      );
+      if (unmatchedFiles.length > 0) {
+        log().debug(
+          { files: unmatchedFiles.map((f) => f.filename) },
+          'changed files with no matched functions (new files or top-level code)'
+        );
+      }
 
-    // Phase 8: Call Claude for the review
-    console.log('[7/7] Calling Claude for review...');
-    const review = await getReview(ANTHROPIC_API_KEY, pr, context, staticIssues);
-    console.log(`      ${review.comments.length} comment(s) generated`);
+      log().info(
+        {
+          changedFunctions: changedFunctions.length,
+          changedGlobals: changedGlobals.length,
+          directCallers: affectedFunctions.directCallers.length,
+          globalReferencers: globalReferencers.length,
+        },
+        '[4/8] Call graph built'
+      );
 
-    // Post review to GitHub
-    console.log('\nPosting review to GitHub...');
-    await postReview(GITHUB_TOKEN, owner, repo, pr, review, changedFiles);
+      // [5/8] Assemble priority-ordered context within the token budget
+      log().info('Assembling context...');
+      const context = assembleContext(changedFiles, affectedFunctions, changedGlobals, globalReferencers);
+      log().info({ totalTokens: context.totalTokens }, '[5/8] Context assembled');
+
+      // [6/8] Run eslint and tsc on changed files to surface confirmed issues
+      log().info('Running static analysis...');
+      const staticIssues = await runStaticAnalysis(changedFiles);
+      log().info({ issueCount: staticIssues.length }, '[6/8] Static analysis complete');
+
+      // [7/8] Send context to Claude and get structured inline comments
+      log().info('Calling Claude for review...');
+      const review = await getReview(anthropic, pr, context, staticIssues);
+      log().info({ commentCount: review.comments.length }, '[7/8] Review generated');
+
+      // [8/8] Filter out false positives using a second Claude call as judge
+      log().info('Judging comments...');
+      const validatedComments = await judgeReview(anthropic, pr, review.comments, context);
+      log().info(
+        { passed: validatedComments.length, total: review.comments.length },
+        '[8/8] Judging complete'
+      );
+
+      log().info('Posting review to GitHub...');
+      await postReview(octokit, owner, repo, pr, { ...review, comments: validatedComments }, changedFiles);
+    } catch (err) {
+      log().error({ err }, 'Review failed');
+      process.exit(1);
+    }
   });
 
 program.parse();
-
-// Extract all new-file line numbers touched by a diff patch
-function parsePatchLines(patch: string): Set<number> {
-  const lines = new Set<number>();
-  let newLine = 0;
-
-  for (const row of patch.split('\n')) {
-    const hunkHeader = row.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-    if (hunkHeader) {
-      newLine = parseInt(hunkHeader[1]!, 10) - 1;
-      continue;
-    }
-    if (row.startsWith('-')) continue;
-    newLine++;
-    if (row.startsWith('+')) lines.add(newLine);
-  }
-
-  return lines;
-}

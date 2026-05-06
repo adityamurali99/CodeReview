@@ -10,6 +10,13 @@ export interface FunctionDef {
   returnType: string;
 }
 
+export interface GlobalDef {
+  name: string;
+  file: string;
+  line: number;
+  body: string;
+}
+
 type FunctionNode =
   | ts.FunctionDeclaration
   | ts.MethodDeclaration
@@ -25,7 +32,7 @@ function isFunctionNode(node: ts.Node): node is FunctionNode {
   );
 }
 
-function resolveName(node: FunctionNode): string {
+function resolveFunctionName(node: FunctionNode): string {
   if ((ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) && node.name) {
     return node.name.text;
   }
@@ -35,6 +42,7 @@ function resolveName(node: FunctionNode): string {
     return className ? `${className}.${node.name.text}` : node.name.text;
   }
 
+  // Arrow functions and anonymous expressions — check if assigned to a variable
   const parent = node.parent;
   if (ts.isVariableDeclaration(parent) && ts.isIdentifier(parent.name)) {
     return parent.name.text;
@@ -49,9 +57,7 @@ function resolveName(node: FunctionNode): string {
 function findParentClassName(node: ts.Node): string | null {
   let current: ts.Node = node.parent;
   while (current) {
-    if (ts.isClassDeclaration(current) && current.name) {
-      return current.name.text;
-    }
+    if (ts.isClassDeclaration(current) && current.name) return current.name.text;
     current = current.parent;
   }
   return null;
@@ -61,13 +67,13 @@ function visitFunctionNode(
   node: ts.Node,
   sourceFile: ts.SourceFile,
   filename: string,
-  functions: FunctionDef[]
+  results: FunctionDef[]
 ): void {
   if (isFunctionNode(node)) {
     const start = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
     const end = sourceFile.getLineAndCharacterOfPosition(node.getEnd());
-    functions.push({
-      name: resolveName(node),
+    results.push({
+      name: resolveFunctionName(node),
       file: filename,
       startLine: start.line + 1,
       endLine: end.line + 1,
@@ -76,14 +82,14 @@ function visitFunctionNode(
       returnType: node.type ? node.type.getText(sourceFile) : '',
     });
   }
-  ts.forEachChild(node, (child) => visitFunctionNode(child, sourceFile, filename, functions));
+  ts.forEachChild(node, (child) => visitFunctionNode(child, sourceFile, filename, results));
 }
 
 export function parseFunctions(filename: string, content: string): FunctionDef[] {
   const sourceFile = ts.createSourceFile(filename, content, ts.ScriptTarget.Latest, true);
-  const functions: FunctionDef[] = [];
-  visitFunctionNode(sourceFile, sourceFile, filename, functions);
-  return functions;
+  const results: FunctionDef[] = [];
+  visitFunctionNode(sourceFile, sourceFile, filename, results);
+  return results;
 }
 
 export function getFunctionsInRange(
@@ -91,24 +97,20 @@ export function getFunctionsInRange(
   filename: string,
   changedLines: Set<number>
 ): FunctionDef[] {
-  return functions.filter(
-    (fn) =>
-      fn.file === filename &&
-      [...changedLines].some((line) => line >= fn.startLine && line <= fn.endLine)
-  );
-}
-
-export interface GlobalDef {
-  name: string;
-  file: string;
-  line: number;
-  body: string;
+  return functions.filter((fn) => {
+    if (fn.file !== filename) return false;
+    for (const line of changedLines) {
+      if (line >= fn.startLine && line <= fn.endLine) return true;
+    }
+    return false;
+  });
 }
 
 export function parseGlobals(filename: string, content: string): GlobalDef[] {
   const sourceFile = ts.createSourceFile(filename, content, ts.ScriptTarget.Latest, true);
   const globals: GlobalDef[] = [];
 
+  // Only inspect top-level statements — globals inside functions or classes are out of scope
   for (const statement of sourceFile.statements) {
     if (!ts.isVariableStatement(statement)) continue;
     for (const decl of statement.declarationList.declarations) {

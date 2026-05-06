@@ -21,8 +21,8 @@ export class GitHubClient {
   private owner: string;
   private repo: string;
 
-  constructor(token: string, owner: string, repo: string) {
-    this.octokit = new Octokit({ auth: token });
+  constructor(octokit: Octokit, owner: string, repo: string) {
+    this.octokit = octokit;
     this.owner = owner;
     this.repo = repo;
   }
@@ -51,12 +51,12 @@ export class GitHubClient {
       per_page: 100,
     });
 
-    const files = await Promise.all(
+    return Promise.all(
       data.map(async (file) => {
         const status = file.status as ChangedFile['status'];
         const [oldContent, newContent] = await Promise.all([
-          status !== 'added' ? this.getFileContent(file.filename, pr.baseSha) : null,
-          status !== 'deleted' ? this.getFileContent(file.filename, pr.headSha) : null,
+          status !== 'added' ? this.fetchFileContent(file.filename, pr.baseSha) : null,
+          status !== 'deleted' ? this.fetchFileContent(file.filename, pr.headSha) : null,
         ]);
 
         return {
@@ -68,8 +68,6 @@ export class GitHubClient {
         };
       })
     );
-
-    return files;
   }
 
   async getFileTree(sha: string): Promise<string[]> {
@@ -93,7 +91,7 @@ export class GitHubClient {
       const batch = paths.slice(i, i + BATCH_SIZE);
       await Promise.all(
         batch.map(async (p) => {
-          const content = await this.getFileContent(p, ref);
+          const content = await this.fetchFileContent(p, ref);
           if (content !== null) result.set(p, content);
         })
       );
@@ -102,12 +100,12 @@ export class GitHubClient {
     return result;
   }
 
-  private async getFileContent(path: string, ref: string): Promise<string | null> {
+  private async fetchFileContent(filePath: string, ref: string): Promise<string | null> {
     try {
       const { data } = await this.octokit.repos.getContent({
         owner: this.owner,
         repo: this.repo,
-        path,
+        path: filePath,
         ref,
       });
 

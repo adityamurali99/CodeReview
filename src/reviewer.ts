@@ -84,12 +84,12 @@ function buildPrompt(pr: PRMetadata, context: AssembledContext, issues: StaticIs
 }
 
 export async function getReview(
-  apiKey: string,
+  client: Anthropic,
   pr: PRMetadata,
   context: AssembledContext,
   issues: StaticIssue[]
 ): Promise<Review> {
-  const client = new Anthropic({ apiKey });
+  const { log } = await import('./logger');
 
   const response = await client.messages.create({
     model: MODEL,
@@ -104,9 +104,17 @@ export async function getReview(
     ],
   });
 
+  log().debug({ stopReason: response.stop_reason, contentBlocks: response.content.length }, 'reviewer: raw response');
+
   const toolUse = response.content.find((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use');
   if (!toolUse) throw new Error('Claude did not return a structured review');
 
   const input = toolUse.input as { summary: string; comments: ReviewComment[] };
+
+  log().debug(
+    { commentCount: input.comments.length, summary: input.summary.slice(0, 120) },
+    'reviewer: parsed result'
+  );
+
   return { summary: input.summary, comments: input.comments };
 }
